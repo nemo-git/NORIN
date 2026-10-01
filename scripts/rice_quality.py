@@ -24,7 +24,14 @@ import pandas as pd
 
 AMD_ELEMENTS = ("TMP_mea", "GSR", "APCP")
 DEFAULT_POINTS_CSV = Path(__file__).with_name("amydas2_409points.csv")
+DEFAULT_ENS1M_DIR = Path("/mnt/e/data/ENS1M")
 R8_SURVEY_SHEET_NAME = "R8調査表"
+ENS1M_MEAN_VARIABLES = {
+    "TMP_mea": ("TMP", "TMP_mean_daymean"),
+    "GSR": ("GSR", "GSR_mean"),
+    "APCP": ("APCP", "APCP_daysum_mean"),
+}
+RATIO_BIAS_ELEMENTS = {"GSR", "APCP"}
 
 
 @dataclass(frozen=True)
@@ -307,12 +314,12 @@ def fetch_amd_point_weather(
 
     fetched: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
     for element in elements:
-        values, times, lats, lons = AMD.GetMetData(element, timedomain, lalodomain, cli=cli)
+        values, times, lats, lons = AMD.GetMetData(element, timedomain, lalodomain, cli=cli, url=amd_url)
         fetched[element] = (np.asarray(values, dtype=float), np.asarray(times), np.asarray(lats), np.asarray(lons))
 
     result: list[PointWeather] = []
     for _, row in points.iterrows():
-        frame = pd.DataFrame()
+        frame = pd.DataFrame(index=pd.DatetimeIndex([]))
         time_index: pd.DatetimeIndex | None = None
         for element, (values, times, lats, lons) in fetched.items():
             lat_i = int(np.nanargmin(np.abs(lats - float(row["lat"]))))
@@ -325,6 +332,118 @@ def fetch_amd_point_weather(
     return result
 
 
+def fetch_ens1m_mean_point_weather(
+    points: pd.DataFrame,
+    start_date: str | date,
+    end_date: str | date,
+    elements: Sequence[str] = AMD_ELEMENTS,
+    ens1m_dir: str | Path = DEFAULT_ENS1M_DIR,
+    initial_date: str | date | None = None,
+) -> list[PointWeather]:
+    """Fetch ENS1M daily ensemble mean values and extract nearest grid cells."""
+    import xarray as xr
+
+    start = parse_date(start_date)
+    end = parse_date(end_date)
+    initial = parse_date(initial_date or start)
+    ens1m_dir = Path(ens1m_dir)
+
+    empty_index = pd.DatetimeIndex([])
+    frames = {str(row["point_id"]): pd.DataFrame(index=empty_index) for _, row in points.iterrows()}
+    for element in elements:
+        ens_element, variable = _ens1m_mean_variable(element)
+        ens_path = _ens1m_daily_file(ens1m_dir, initial, ens_element)
+        with xr.open_dataset(ens_path) as ds:
+            if variable not in ds:
+                raise ValueError(f"{ens_path} does not contain variable {variable}")
+            data = ds[variable].sel(time=slice(pd.Timestamp(start), pd.Timestamp(end)))
+            if data.sizes.get("time", 0) == 0:
+                continue
+            data = _convert_ens1m_units(element, data)
+            lats = np.asarray(ds["latitude"].values, dtype=float)
+            lons = np.asarray(ds["longitude"].values, dtype=float)
+            times = pd.to_datetime(data["time"].values).normalize()
+            values = np.asarray(data.values, dtype=float)
+            for _, row in points.iterrows():
+                point_id = str(row["point_id"])
+                lat_i = int(np.nanargmin(np.abs(lats - float(row["lat"]))))
+                lon_i = int(np.nanargmin(np.abs(lons - float(row["lon"]))))
+                series = pd.Series(values[:, lat_i, lon_i], index=times)
+                frames[point_id] = frames[point_id].reindex(frames[point_id].index.union(series.index))
+                frames[point_id].loc[series.index, element] = series
+
+    return [
+        PointWeather(str(row["point_id"]), float(row["lat"]), float(row["lon"]), frames[str(row["point_id"])])
+        for _, row in points.iterrows()
+    ]
+
+
+def fetch_hybrid_amd_ens1m_mean_point_weather(
+    points: pd.DataFrame,
+    start_date: str | date,
+    end_date: str | date,
+    elements: Sequence[str] = AMD_ELEMENTS,
+    switch_date: str | date | None = None,
+    ens1m_dir: str | Path = DEFAULT_ENS1M_DIR,
+    amd_url: str = "https://amd.rd.naro.go.jp/opendap/AMD/",
+    ratio_eps: float = 1.0e-6,
+) -> list[PointWeather]:
+    """Use AMD before switch_date and bias-corrected ENS1M mean from switch_date."""
+    if switch_date is None:
+        raise ValueError("switch_date is required")
+    start = parse_date(start_date)
+    end = parse_date(end_date)
+    switch = parse_date(switch_date)
+
+    if end < switch:
+        return fetch_amd_point_weather(points, start, end, elements, amd_url=amd_url)
+
+    amd_fetch_start = min(start, switch)
+    amd_fetch_end = max(min(end, switch), switch)
+    amd = fetch_amd_point_weather(points, amd_fetch_start, amd_fetch_end, elements, amd_url=amd_url)
+    amd_by_point = {w.point_id: w for w in amd}
+
+    ens = fetch_ens1m_mean_point_weather(
+        points,
+        switch,
+        end,
+        elements,
+        ens1m_dir=ens1m_dir,
+        initial_date=switch,
+    )
+    ens_by_point = {w.point_id: w for w in ens}
+
+    result: list[PointWeather] = []
+    switch_ts = pd.Timestamp(switch)
+    for _, row in points.iterrows():
+        point_id = str(row["point_id"])
+        frame = pd.DataFrame(index=pd.DatetimeIndex([]))
+        amd_frame = amd_by_point[point_id].data
+        ens_frame = ens_by_point[point_id].data
+        for element in elements:
+            if start < switch:
+                actual = amd_frame.loc[
+                    (amd_frame.index >= pd.Timestamp(start)) & (amd_frame.index < switch_ts),
+                    element,
+                ]
+                frame = frame.reindex(frame.index.union(actual.index))
+                frame.loc[actual.index, element] = actual
+            amd_anchor = float(amd_frame.loc[switch_ts, element])
+            ens_series = ens_frame[element].dropna()
+            if switch_ts not in ens_series.index:
+                raise ValueError(f"ENS1M {element} is missing switch date {switch}")
+            ens_anchor = float(ens_series.loc[switch_ts])
+            if element in RATIO_BIAS_ELEMENTS:
+                factor = 1.0 if abs(ens_anchor) <= ratio_eps else amd_anchor / ens_anchor
+                corrected = ens_series * factor
+            else:
+                corrected = ens_series + (amd_anchor - ens_anchor)
+            frame = frame.reindex(frame.index.union(corrected.index))
+            frame.loc[corrected.index, element] = corrected
+        result.append(PointWeather(point_id, float(row["lat"]), float(row["lon"]), frame))
+    return result
+
+
 def estimate_quality_for_points(
     points: pd.DataFrame,
     weather_provider: Callable[[pd.DataFrame, date, date, Sequence[str]], list[PointWeather]],
@@ -333,8 +452,9 @@ def estimate_quality_for_points(
     default_mode: int = 1,
     default_correction: float = 0.0,
     max_dvi_days: int = 140,
+    include_amylose: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Run heading, amylose, and protein calculations for all points."""
+    """Run heading and protein calculations for all points, with optional amylose."""
     points = points.copy()
     if "transplant_date" not in points:
         points["transplant_date"] = f"{year}-{default_transplant_date}"
@@ -354,7 +474,8 @@ def estimate_quality_for_points(
             heading_dates[point_id] = estimate_heading_date(dvi_by_point[point_id], row["transplant_date"])
 
     weather_start = min(d - timedelta(days=30) for d in heading_dates.values())
-    weather_end = max(d + timedelta(days=24) for d in heading_dates.values())
+    days_after_heading = 24 if include_amylose else 20
+    weather_end = max(d + timedelta(days=days_after_heading) for d in heading_dates.values())
     weather = weather_provider(points, weather_start, weather_end, AMD_ELEMENTS)
     weather_by_point = {w.point_id: w for w in weather}
 
@@ -369,7 +490,7 @@ def estimate_quality_for_points(
             if "correction" in points and pd.notna(row.get("correction"))
             else default_correction
         )
-        amylose = estimate_amylose(point_weather.data["TMP_mea"], heading)
+        amylose = estimate_amylose(point_weather.data["TMP_mea"], heading) if include_amylose else {}
         protein = estimate_protein_at_point(point_weather.data, heading, mode=mode, correction=correction)
         rows.append(
             {
@@ -427,16 +548,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--year", type=int, default=2026)
     parser.add_argument("--use-amd", action="store_true", help="AMD_Tools4.pyで実データを取得します。")
     parser.add_argument("--amd-url", default="https://amd.rd.naro.go.jp/opendap/AMD/")
+    parser.add_argument("--ens1m-start-date", help="この日以降はENS1M日別アンサンブル平均をAMD切替日値で補正して使用します。")
+    parser.add_argument("--ens1m-dir", default=str(DEFAULT_ENS1M_DIR), help="ENS1M NetCDFのルートディレクトリ。")
+    parser.add_argument("--skip-amylose", action="store_true", help="タンパク推定のみを行い、アミロース計算を省略します。")
     parser.add_argument("--output", default="rice_quality_points.csv")
     args = parser.parse_args(argv)
 
     points = load_points_csv(args.points_csv)
 
-    if args.use_amd:
+    if args.ens1m_start_date:
+        provider = lambda p, s, e, elements: fetch_hybrid_amd_ens1m_mean_point_weather(
+            p,
+            s,
+            e,
+            elements,
+            switch_date=args.ens1m_start_date,
+            ens1m_dir=args.ens1m_dir,
+            amd_url=args.amd_url,
+        )
+    elif args.use_amd:
         provider = lambda p, s, e, elements: fetch_amd_point_weather(p, s, e, elements, amd_url=args.amd_url)
     else:
         provider = fake_weather_provider
-    point_results, aggregate = estimate_quality_for_points(points, provider, year=args.year)
+    point_results, aggregate = estimate_quality_for_points(points, provider, year=args.year, include_amylose=not args.skip_amylose)
     point_results.to_csv(args.output, index=False)
     print(f"Calculated {len(point_results)} points from {args.points_csv}")
     if len(point_results) > 20:
@@ -449,6 +583,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{key}: {value}")
     print(f"\nWrote {args.output}")
     return 0
+
+
+def _ens1m_mean_variable(element: str) -> tuple[str, str]:
+    try:
+        return ENS1M_MEAN_VARIABLES[element]
+    except KeyError as exc:
+        raise ValueError(f"ENS1M mean variable is not defined for {element}") from exc
+
+
+def _ens1m_daily_file(ens1m_dir: Path, initial_date: date, ens_element: str) -> Path:
+    path = ens1m_dir / str(initial_date.year) / ens_element / f"ENS1M_daily_{initial_date:%Y%m%d}_{ens_element}.nc"
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _convert_ens1m_units(element: str, data):
+    units = str(data.attrs.get("units", "")).lower()
+    if element == "TMP_mea" and (units in {"k", "kelvin"} or float(data.mean(skipna=True)) > 100.0):
+        return data - 273.15
+    return data
 
 
 def _slice_by_date(series: pd.Series, start: date, end: date | None) -> pd.Series:
